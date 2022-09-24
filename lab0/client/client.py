@@ -205,8 +205,13 @@ class Client:
         >>> profile = {'bio': 'I like computer security and cryptography', 'location': 'MIT', 'camera': 'mobile phone'}
         >>> alice.update_public_profile(profile)
         """
-        # TODO (lab0): Ask the server to update the client's public profile
-        raise NotImplementedError
+        for key, value in values.items():
+            self._public_profile.profile[key] = value
+        req = types.UpdatePublicProfileRequest(self.username, self._server_session_token, self._public_profile)
+        resp = self.send_rpc(req)
+        assert isinstance(resp, types.UpdatePublicProfileResponse)
+        if resp.error is not None:
+            raise Exception(resp)
 
     def get_friend_public_profile(self, friend_username: str) -> types.PublicProfile:
         """Obtain the public profile of another user.
@@ -224,8 +229,10 @@ class Client:
         {'bio': 'I like computer security and cryptography', 'location': 'MIT', 'camera': 'mobile phone'}
         """
         # TODO (lab0): Fetch and return the public profile of the user friend_username
-        raise NotImplementedError
-
+        req = types.GetFriendPublicProfileRequest(self.username, self._server_session_token, friend_username)
+        resp = self.send_rpc(req)
+        assert isinstance(resp, types.GetFriendPublicProfileResponse)
+        return resp.public_profile
 
 
     def list_photos(self) -> t.List[int]:
