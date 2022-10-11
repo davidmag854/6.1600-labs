@@ -25,11 +25,13 @@ def run_tests():
     # TODO add timeouts to tests (to handle infinite loops)
 
     total_pts = 0
+    i=0
     for test_case, test_points in tests:
+        # if i ==0:
         points = test_case()
         print(f"{test_case.__name__}: {points}/{test_points} point(s)")
         total_pts += points
-
+        i+=1
     max_score = sum([p for _, p in tests])
 
     print("----------------------------------------------------------------")

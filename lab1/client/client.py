@@ -77,6 +77,9 @@ class Client:
         self._photos: t.List[bytes] = []  # list of photos in put_photo order
         self._last_log_number: int = 0
         self._next_photo_id = 0
+        self._photo_signatures = dict()
+        self._photo_sig_chain = hash(None)
+        self._log_sign_chain = hash(None)
 
     def send_rpc(self, request: types.RpcObject) -> types.RpcObject:
         """
@@ -146,16 +149,22 @@ class Client:
         >>> alice.login()
         """
         # for a REGISTER log entry, we just zero the photo-related field
-        log = LogEntry(types.OperationCode.REGISTER, 0)
+        # if self._last_log_number != 0:
+        #     raise errors.SynchronizationError(None)
+        signature = self.sign(types.OperationCode.REGISTER.value, 0)
+        log = LogEntry(types.OperationCode.REGISTER, 0, signature)
         req = types.RegisterRequest(
             self._client_id, self._username, self._auth_secret, log.encode()
         )
-
+        # print(f"Registration log: {log}")
         resp = self.send_rpc(req)
         assert isinstance(resp, types.RegisterResponse)
         if resp.error is None:
             self._last_log_number += 1
+            # print(f"+=+= current last log: {self._last_log_number}")
             self._server_session_token = resp.token
+            self._token_sig = hash(str(signature) + str(resp.token))
+
 
         elif resp.error == types.Errcode.USER_ALREADY_EXISTS:
             raise errors.UserAlreadyExistsError(self._username)
@@ -203,8 +212,6 @@ class Client:
         else:
             raise Exception(resp)
 
-
-
     def list_photos(self) -> t.List[int]:
         """Fetch a list containing the photo id of each photo stored
         by the user.
@@ -226,7 +233,8 @@ class Client:
         [0, 1, 2]
         """
         self._synchronize()
-
+        if len(self._photos) != self._next_photo_id:
+            raise errors.SynchronizationError(None)
         return list(range(self._next_photo_id))
 
     def get_photo(self, photo_id) -> bytes:
@@ -303,11 +311,11 @@ class Client:
         >>> alice.put_photo(photo_blob)
         2
         """
+        # print("Started PUT operation for ", photo_blob)
         self._synchronize()
-
         photo_id = self._next_photo_id
-
-        log = LogEntry(types.OperationCode.PUT_PHOTO, photo_id)
+        signature = self.sign(types.OperationCode.PUT_PHOTO.value, photo_id, photo_blob)
+        log = LogEntry(types.OperationCode.PUT_PHOTO, photo_id, signature)
         req = types.PutPhotoRequest(
             self._client_id,
             self._username,
@@ -326,6 +334,10 @@ class Client:
 
         self._record_new_photo(photo_blob)
         self._last_log_number += 1
+        # self.print_data()
+        # print(f"END OF Photo PUT\n"
+        #       f"photos: {self._photos}\n"
+        #       f"total logs: {self._last_log_number}")
         return photo_id
 
     def _record_new_photo(self, photo_blob):
@@ -334,6 +346,42 @@ class Client:
         """
         self._next_photo_id += 1
         self._photos.append(photo_blob)
+        signature = self.sign(0, self._next_photo_id-1, photo_blob)
+        self._photo_signatures[self._next_photo_id-1] = signature
+        self._photo_sig_chain = hash(hash(self._photo_sig_chain) + signature)
+
+    def sign(self, opcode, i, photo_blob=None):
+        s = str(self.user_secret) + str(opcode) + str(i)
+        if photo_blob is not None:
+            s += str(photo_blob.decode('utf-8')) + str(self._photo_sig_chain)
+        # print(f"+++++++++\n"
+        #       f"secret: {str(self.user_secret)}\n"
+        #       f"opcode: {str(opcode)}\n"
+        #       f"photo_id: {str(i)}\n"
+        #       f"photo_blob: {str(photo_blob)}\n"
+        #       f"hash: {hash(s)}\n"
+        #       f"+++Created hash++++")
+        self._log_sign_chain = hash(hash(s) + hash(str(self._log_sign_chain)))
+        return self._log_sign_chain
+
+    def check_log_signature(self, log, photo_blob=None):
+        received_hash = log.signature
+        s = str(self.user_secret) + str(log.opcode) + str(log.photo_id)
+        if photo_blob is not None:
+            s += str(photo_blob.decode('utf-8')) + str(self._photo_sig_chain)
+        if received_hash == hash(hash(s) + hash(str(self._log_sign_chain))):
+            self._log_sign_chain = received_hash
+            return True
+        return False
+
+    def check_sequence(self, received_id):
+        """
+        we should only receive updates from the server
+        thus if we receive an old id this means we diverged
+        :param received_id:
+        :return:
+        """
+        return received_id < self._next_photo_id
 
     def _synchronize(self):
         """Synchronize the client's state against the server.
@@ -364,12 +412,15 @@ class Client:
         >>> alicebis.put_photo(photo_blob)
         2
         """
+        # print(f"===last log number==={self._last_log_number}")
+        # print(self._photos)
         req = types.SynchronizeRequest(
             self._client_id,
             self._username,
             self._server_session_token,
             self._last_log_number,
         )
+
         resp = self.send_rpc(req)
         assert isinstance(resp, types.SynchronizeResponse)
 
@@ -379,17 +430,45 @@ class Client:
             raise errors.SynchronizationError(errors.VersionTooHighError())
         elif resp.error is not None:
             raise Exception(resp)
-
-
+        log_sequence_check = set()
+        last_index = self._next_photo_id-1
+        logs = []
         for encoded in resp.encoded_log_entries:
             try:
-                log = LogEntry.decode(encoded)
+                logs.append(LogEntry.decode(encoded))
             except errors.MalformedEncodingError as e:
                 raise errors.SynchronizationError(e)
+        for log in logs:
+            if log.photo_id:
+                if log.photo_id in log_sequence_check:
+                    # print("photo id has been seen")
+                    raise errors.SynchronizationError(None)
+                log_sequence_check.add(log.photo_id)
+            if log.opcode not in {1,2}:
+                print("op code not corrent")
+                raise errors.SynchronizationError(None)
+            if log.opcode == types.OperationCode.REGISTER.value:
+                if log.photo_id != self._next_photo_id:
+                    # if we registered the log id should be the same as next
+                    # photo id
+                    raise errors.SynchronizationError(None)
+                if not self.check_log_signature(log, None):
+                    raise errors.SynchronizationError(None)
             if log.opcode == types.OperationCode.PUT_PHOTO.value:
+                if log.photo_id != last_index + 1:
+                    # print("logs not in sequence")
+                    raise errors.SynchronizationError(None)
+                last_index += 1
+                if log.photo_id <= self._next_photo_id - 1:
+                    # print("log received with higher value")
+                    raise errors.SynchronizationError(None)
                 photo_blob = self._fetch_photo(log.photo_id)
+                if not self.check_log_signature(log, photo_blob):
+                    # print("wrong signature")
+                    raise errors.SynchronizationError(None)
                 self._record_new_photo(photo_blob)
             self._last_log_number += 1
+
 
 
 class LogEntry:
@@ -397,34 +476,45 @@ class LogEntry:
         self,
         opcode: types.OperationCode,
         photo_id: int,
+        signature
     ) -> None:
         """
         Generates a new log entry. `photo_id` should be 0 for a register entry.
         """
         self.opcode = opcode.value
         self.photo_id = photo_id
+        self.signature = signature
 
     def encode(self) -> bytes:
         return codec.encode(
             [
                 self.opcode,
                 self.photo_id,
+                self.signature
             ]
         )
 
     def data_hash(self) -> bytes:
         return crypto.data_hash(self.encode())
 
+    def __str__(self):
+        return f"opcode: {self.opcode}," \
+               f"photo_id: {self.photo_id}," \
+               f"signature: {self.signature}"
+
     @classmethod
     def decode(cls, data: bytes) -> "LogEntry":
-        opcode, photo_id = codec.decode(data)
-        return cls(types.OperationCode(opcode), photo_id)
+        opcode, photo_id, signature = codec.decode(data)
+        if opcode not in {1, 2}:
+            raise errors.SynchronizationError(None)
+        return cls(types.OperationCode(opcode), photo_id, signature)
 
 
-def log_entry(opcode, photo_id):
+def log_entry(opcode, photo_id, signature):
     return {
         'opcode':   opcode.value,
         'photo_id': photo_id,
+        'signature': signature
     }
 
 

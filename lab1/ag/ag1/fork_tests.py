@@ -108,23 +108,31 @@ def test_single_photo_fork():
         user_secret = alice_a.user_secret
         alice_b = client.Client("alice", user_secret=user_secret)
         link_client_server(alice_b, server)
+        # print("Alice A Register")
         alice_a.register()
+        # print("Alice A Login")
         alice_a.login()
         photo_blob0 = b"photo0"
         if alice_a.put_photo(photo_blob0) != 0:
             pts -= 1
+        # print("Alice A put photo 0")
         if alice_a.put_photo(b"photo1_a") != 1:
             pts -= 1
+        # print("Alice A put photo 1")
 
+        # print("Alice B Login")
         alice_b.login()
         if alice_b.put_photo(b"photo1_b") != 1:
             # note both this and the above return 1!
             pts -= 1
+        # print("Alice B put photo 1")
 
+        # print("Alice A login")
         alice_a.login()
         photo_blob2 = b"photo2"
         if alice_a.put_photo(photo_blob2) != 2:
             pts -= 1
+
 
         # when alice_b logs in and synchronizes here,
         # they will see alice_a's photo2. However,
@@ -132,9 +140,11 @@ def test_single_photo_fork():
         # therefore, alice_b must realize that there
         # is an error here in order to implement the
         # security properties.
+        # print("Alice B login")
         alice_b.login()
         photo_blob3 = b"photo3"
         try:
+            # print("Alice B will try to put photo 3 should fail")
             alice_b.put_photo(photo_blob3)
             pts = 0
         except errors.SynchronizationError:
