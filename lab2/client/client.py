@@ -422,9 +422,6 @@ class Client:
         if log.pk not in self._device_added_set and log.opcode not in {1, 4}:
             # in registration we still haven't added the device
             # when a device accepts invite they will push log abd only then other devices will be able to add
-            print(f"message added by {log.pk}")
-            print(f"log is {log}")
-            print(f"Allowed users {self._device_added_set}")
             raise errors.SynchronizationError("device not allowed to add log")
 
     def _synchronize(self):
@@ -623,7 +620,6 @@ class Client:
                 log = LogEntry.decode(encoded)
             except errors.MalformedEncodingError as e:
                 raise errors.SynchronizationError(e)
-            print(log)
             if friend_info.last_log_number == 0 and log.opcode == OperationCode.REGISTER.value:
                 h = self.hash_block(log.opcode, log.data, friend_info.last_hash)
                 if h == log.h:

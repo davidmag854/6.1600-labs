@@ -48,6 +48,9 @@ class PutPhotoLogData(LogData):
 class OperationCode(IntEnum):
     REGISTER = auto()
     PUT_PHOTO = auto()
+    DEVICE_INVITE = auto()
+    DEVICE_ADDED = auto()
+    DEVICE_REVOKED = auto()
 
 
 class LogEntry:
@@ -55,15 +58,25 @@ class LogEntry:
         self,
         opcode: OperationCode,
         data: bytes,
+        h,
+        public_key,
+        signature
     ) -> None:
         """
         Generates a new log entry with the given data
         """
         self.opcode = opcode.value
         self.data = data
+        self.h = h
+        self.pk = public_key
+        self.signature = signature
 
     def __str__(self) -> str:
-        return f"LogEntry(opcode={OperationCode(self.opcode)}, data={self.data})"
+        return f"LogEntry(opcode={OperationCode(self.opcode)}\n" \
+               f", data={self.data}\n" \
+               f", hash={self.h})\n" \
+               f"  pk={self.pk}\n" \
+               f"  signa={self.signature}"
 
     def encode(self) -> bytes:
         """
@@ -74,6 +87,9 @@ class LogEntry:
             [
                 self.opcode,
                 self.data,
+                self.h,
+                self.pk,
+                self.signature
             ]
         )
         return result
@@ -83,9 +99,9 @@ class LogEntry:
         """
         Decode this log entry and the contained data
         """
-        opcode_int, log_data = codec.decode(data)
+        opcode_int, log_data, h, pk, sign = codec.decode(data)
         opcode = OperationCode(opcode_int)
-        return LogEntry(opcode, log_data)
+        return LogEntry(opcode, log_data, h, pk, sign)
 
     def data_hash(self) -> bytes:
         return crypto.data_hash(self.encode())
