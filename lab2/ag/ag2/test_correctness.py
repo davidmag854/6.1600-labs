@@ -26,7 +26,6 @@ def view_friend_photos():
     # alice can view bob's photos
     alice.add_friend("bob", bob.public_key)
     bob_photos = alice.get_friend_photos("bob")
-
     expected = [b"bob_photo_0", b"bob_another_photo"]
     if not bob_photos == expected:
         print(f"Incorrect photos returned! Expected {expected}, got {bob_photos}")
@@ -70,17 +69,13 @@ def dual_device_friend():
     pts = 1
     server = ReferenceServer()
     alice, bob = two_clients(server)
-
     bob_2 = new_device(server, bob)
     bob.invite_device(bob_2.public_key)
     bob_2.login()
     bob_2.accept_invite(bob.public_key)
-
     bob_2.put_photo(b"bob_2_photo")
-
     bob.login()
     bob.put_photo(b"bob_photo_2")
-
     # alice adds bob's original device as a friend,
     # and should then return the photos pushed by both devices
     alice.add_friend("bob", bob.public_key)

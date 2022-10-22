@@ -67,24 +67,28 @@ def run_tests():
     max_score = 0
     starter_pts = 0
     results = []
+    i = 0
     for test_name, (test_case, test_points, starter_points) in tests.items():
-        max_score += test_points
-        try:
-            points = test_case()
-        except Exception as e:
-            traceback.print_exc()
-            points = 0
-        print(f"{test_case.__name__}: {points}/{test_points} point(s)")
-        total_pts += points
-        starter_pts += starter_points
-        results.append(
-            {
-                "name": test_name,
-                "max_score": test_points,
-                "starter_score": starter_points,
-                "score": points,
-            }
-        )
+        # if i == 0:
+        if i != -1:
+            max_score += test_points
+            try:
+                points = test_case()
+            except Exception as e:
+                traceback.print_exc()
+                points = 0
+            print(f"{test_case.__name__}: {points}/{test_points} point(s)")
+            total_pts += points
+            starter_pts += starter_points
+            results.append(
+                {
+                    "name": test_name,
+                    "max_score": test_points,
+                    "starter_score": starter_points,
+                    "score": points,
+                }
+            )
+        i += 1
 
     print("----------------------------------------------------------------")
     print("total: {} / {} pts".format(round(total_pts, 3), round(max_score, 3)))

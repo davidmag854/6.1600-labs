@@ -22,6 +22,7 @@ parser.add_argument(
 args = vars(parser.parse_args())
 
 print("================================================================")
+print('ag.ag{}.runner'.format(args["lab"]))
 importlib.import_module('ag.ag{}.runner'.format(args["lab"]))
 results = testing.run_tests()
 print("================================================================")

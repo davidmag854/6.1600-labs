@@ -56,12 +56,10 @@ def two_clients(server: Server) -> t.Tuple[client.Client, client.Client]:
     link_client_server(alice, server)
     bob = client.Client("bob")
     link_client_server(bob, server)
-
     # alice posts a photo
     alice.register()
     alice.login()
     alice.put_photo(b"alice_photo_0")
-
     # bob posts a photo
     bob.register()
     bob.login()

@@ -24,6 +24,8 @@ class FriendInfo:
     trusted_keys: t.Set[bytes]
     photos: t.List[bytes]
     last_log_number: int
+    last_hash: int
+    awaiting_invite: t.Set[bytes]
 
 
 class Client:
@@ -86,12 +88,16 @@ class Client:
         self._public_key_signer = (
             crypto.PublicKeySignature()
         )  # not derived from user secret---every device gets its own key pair
-
         self._photos: t.List[bytes] = []  # list of photos in put_photo order
         self._last_log_number: int = 0
         self._next_photo_id = 0
 
         self._friends: t.Dict[str, FriendInfo] = {}  # maps usernames to friend state
+
+        self._last_log_hash = hash(None)
+        self._device_invite_dict = dict() ## key = inviter, value= set(device invited)
+        self._device_added_set = set()
+        self._device_revoked_set = set()
 
     def send_rpc(self, request: types.RpcObject) -> types.RpcObject:
         """
@@ -144,6 +150,14 @@ class Client:
         """
         return bytes(self._public_key_signer.public_key)
 
+    def hash_block(self, operation, data, friend_hash = None):
+        if friend_hash is None:
+            prev = self._last_log_hash
+        else:
+            prev = friend_hash
+        code = prev + hash(str(operation)) + hash(str(data))
+        return hash(code)
+
     def register(self) -> None:
         """Register this client's username with the server,
         initializing the user's state on the server.
@@ -166,7 +180,9 @@ class Client:
         >>> alice.register()
         >>> alice.login()
         """
-        log = LogEntry(OperationCode.REGISTER, RegisterLogData().encode())
+        h = self.hash_block(OperationCode.REGISTER.value, RegisterLogData().encode())
+        sign = self._public_key_signer.sign(codec.encode(h))
+        log = LogEntry(OperationCode.REGISTER, RegisterLogData().encode(), h, self.public_key, sign)
         req = types.RegisterRequest(
             self._client_id, self._username, self._auth_secret, log.encode()
         )
@@ -176,6 +192,7 @@ class Client:
         if resp.error is None:
             self._last_log_number += 1
             self._server_session_token = resp.token
+            self._last_log_hash = h
 
         elif resp.error == types.Errcode.USER_ALREADY_EXISTS:
             raise errors.UserAlreadyExistsError(self._username)
@@ -222,22 +239,23 @@ class Client:
         assert isinstance(resp, types.LoginResponse)
         if resp.error is None:
             self._server_session_token = resp.token
+            self._device_added_set.add(self.public_key)
         elif resp.error == types.Errcode.LOGIN_FAILED:
             raise errors.LoginFailedError(self._username)
         else:
             raise Exception(resp)
 
-    def update_public_profile(self, values: t.Dict[str, t.Any]) -> None:
-        """Update user public profile with the given fields.
-        """
-        # TODO (lab0): Update te local public profile based on the given values and update the server
-        raise NotImplementedError
-
-    def get_friend_public_profile(self, friend_username: str) -> types.PublicProfile:
-        """Obtain the public profile of another user.
-        """
-        # TODO (lab0): Fetch and return the public profile of the user friend_username
-        raise NotImplementedError
+    # def update_public_profile(self, values: t.Dict[str, t.Any]) -> None:
+    #     """Update user public profile with the given fields.
+    #     """
+    #     # TODO (lab0): Update te local public profile based on the given values and update the server
+    #     raise NotImplementedError
+    #
+    # def get_friend_public_profile(self, friend_username: str) -> types.PublicProfile:
+    #     """Obtain the public profile of another user.
+    #     """
+    #     # TODO (lab0): Fetch and return the public profile of the user friend_username
+    #     raise NotImplementedError
 
     def list_photos(self) -> t.List[int]:
         """Fetch a list containing the photo id of each photo stored
@@ -302,6 +320,8 @@ class Client:
         assert isinstance(resp, types.PushLogEntryResponse)
         if resp.error:
             raise errors.RpcError
+        self._last_log_hash = log_entry.h
+        self._last_log_number += 1
 
     def _fetch_photo(self, photo_id, user: t.Optional[str] = None) -> bytes:
         """Get a photo from the server using the unique PhotoID.
@@ -364,8 +384,10 @@ class Client:
         self._synchronize()
 
         photo_id = self._next_photo_id
-
-        log = LogEntry(OperationCode.PUT_PHOTO, PutPhotoLogData(photo_id).encode())
+        h = self.hash_block(OperationCode.PUT_PHOTO.value, PutPhotoLogData(photo_id).encode()+photo_blob)
+        sign = self._public_key_signer.sign(codec.encode(h))
+        log = LogEntry(OperationCode.PUT_PHOTO, PutPhotoLogData(photo_id).encode(), h,
+                       self.public_key, sign)
         req = types.PutPhotoRequest(
             client_id=self._client_id,
             username=self._username,
@@ -384,6 +406,7 @@ class Client:
 
         self._record_new_photo(photo_blob)
         self._last_log_number += 1
+        self._last_log_hash = h
         return photo_id
 
     def _record_new_photo(self, photo_blob):
@@ -392,6 +415,17 @@ class Client:
         """
         self._next_photo_id += 1
         self._photos.append(photo_blob)
+
+    def verify_signer(self, h, log: LogEntry):
+        if not crypto.verify_sign(log.pk, codec.encode(h), log.signature):
+            raise errors.SynchronizationError("Pk Signature doesn't match")
+        if log.pk not in self._device_added_set and log.opcode not in {1, 4}:
+            # in registration we still haven't added the device
+            # when a device accepts invite they will push log abd only then other devices will be able to add
+            print(f"message added by {log.pk}")
+            print(f"log is {log}")
+            print(f"Allowed users {self._device_added_set}")
+            raise errors.SynchronizationError("device not allowed to add log")
 
     def _synchronize(self):
         """Synchronize the client's state against the server.
@@ -443,23 +477,105 @@ class Client:
                 log = LogEntry.decode(encoded)
             except errors.MalformedEncodingError as e:
                 raise errors.SynchronizationError(e)
+            if log.opcode == OperationCode.REGISTER.value:
+                h = self.hash_block(log.opcode, log.data)
+                if h == log.h:
+                    self.verify_signer(h, log)
+                    self._last_log_hash = h
+                    self._device_added_set.add(log.pk)
+                else:
+                    raise errors.SynchronizationError("Registration Hash does not match!")
             if log.opcode == OperationCode.PUT_PHOTO.value:
                 log_data = PutPhotoLogData.decode(log.data)
                 photo_blob = self._fetch_photo(log_data.photo_id)
-                self._record_new_photo(photo_blob)
+                h = self.hash_block(log.opcode, log.data+photo_blob)
+
+                if h == log.h:
+                    self.verify_signer(h, log)
+                    self._record_new_photo(photo_blob)
+                    self._last_log_hash = h
+                else:
+                    raise errors.SynchronizationError("Issue with photos uploaded!")
+
+            if log.opcode == OperationCode.DEVICE_INVITE.value:
+                h = self.hash_block(log.opcode, log.data)
+                if h == log.h:
+                    self.verify_signer(h, log)
+                    if log.pk in self._device_invite_dict:
+                        self._device_invite_dict[log.pk].add(log.data)
+                    else:
+                        self._device_invite_dict[log.pk] = {log.data}
+                    self._last_log_hash = h
+                else:
+                    raise errors.SynchronizationError("device invite log doesn't match")
+
+            if log.opcode == OperationCode.DEVICE_ADDED.value:
+                h = self.hash_block(log.opcode, log.data)
+                if h == log.h:
+                    self.verify_signer(h, log)
+                    self.remove_invite(log.pk)
+                    self._device_added_set.add(log.pk)
+                    self._last_log_hash = h
+
+            if log.opcode == OperationCode.DEVICE_REVOKED.value:
+                h = self.hash_block(log.opcode, log.data)
+                if h == log.h:
+                    self.verify_signer(h, log)
+                    self.remove_invite(log.data)
+                    if log.data in self._device_added_set and log.data != self.public_key:
+                        self._device_added_set.remove(log.data)
+                        self._device_revoked_set.add(log.data)
+                    self._last_log_hash = h
             self._last_log_number += 1
 
+    def remove_invite(self, pk):
+        for inviter, invitee in self._device_invite_dict.items():
+            if pk in invitee:
+                invitee.remove(pk)
+
     def invite_device(self, device_public_key: bytes) -> None:
-        # TODO (lab2) - before then, these can be blank
-        pass
+        self._synchronize()
+        # h = self.hash_block(OperationCode.PUT_PHOTO.value, PutPhotoLogData(photo_id).encode() + photo_blob)
+        # some pk wants to add a device
+        # my data is the other device pk
+        h = self.hash_block(OperationCode.DEVICE_INVITE.value, device_public_key)
+        sign = self._public_key_signer.sign(codec.encode(h))
+        log = LogEntry(OperationCode.DEVICE_INVITE, device_public_key, h, self.public_key, sign)
+        self._push_log_entry(log)
+        if device_public_key in self._device_revoked_set:
+            self._device_revoked_set.remove(device_public_key)
+        if log.pk in self._device_invite_dict:
+            self._device_invite_dict[log.pk].add(log.data)
+            # print("Deviced added to invite list")
+        else:
+            # print("Deviced added to invite list")
+            self._device_invite_dict[log.pk] = {log.data}
 
     def accept_invite(self, inviter_public_key: bytes) -> None:
-        # TODO (lab2)
-        pass
+        self._synchronize()
+        if inviter_public_key not in self._device_invite_dict:
+            pass
+        elif self.public_key in self._device_invite_dict[inviter_public_key]:
+            h = self.hash_block(OperationCode.DEVICE_ADDED.value, self.public_key)
+            sign = self._public_key_signer.sign(codec.encode(h))
+            log = LogEntry(OperationCode.DEVICE_ADDED, self.public_key, h, self.public_key, sign)
+            self._push_log_entry(log)
+            self._device_added_set.add(self.public_key)
+            self.remove_invite(self.public_key)
+            # print("Device was found and invite list and accepted")
+        # else:
+        #     raise errors.SynchronizationError("Device not invited")
 
     def revoke_device(self, device_public_key: bytes) -> None:
-        # TODO (lab2)
-        pass
+        self._synchronize()
+        h = self.hash_block(OperationCode.DEVICE_REVOKED.value, device_public_key)
+        sign = self._public_key_signer.sign(codec.encode(h))
+        log = LogEntry(OperationCode.DEVICE_REVOKED, device_public_key, h, self.public_key, sign)
+        self._push_log_entry(log)
+        self.remove_invite(device_public_key)
+        if device_public_key in self._device_added_set and device_public_key != self.public_key:
+            self._device_added_set.remove(device_public_key)
+            self._device_revoked_set.add(device_public_key)
 
     def add_friend(self, friend_username: str, friend_public_key: bytes) -> None:
         """
@@ -469,11 +585,19 @@ class Client:
         If the friend already exists, overwrites their public key
         with the provided one.
         """
-        self._friends[friend_username] = FriendInfo(set([friend_public_key]), [], 0)
+        self._friends[friend_username] = FriendInfo(set([friend_public_key]), [], 0, hash(None), set())
 
     def get_friend_photos(self, friend_username) -> t.List[bytes]:
         self._synchronize_friend(friend_username)
         return self._friends[friend_username].photos
+
+    # @dataclass
+    # class FriendInfo:
+    #     trusted_keys: t.Set[bytes]
+    #     photos: t.List[bytes]
+    #     last_log_number: int
+    #     last_hash: int
+    #     awaiting_invite: t.Set[bytes]
 
     def _synchronize_friend(self, friend_username: str):
         """
@@ -499,9 +623,56 @@ class Client:
                 log = LogEntry.decode(encoded)
             except errors.MalformedEncodingError as e:
                 raise errors.SynchronizationError(e)
+            print(log)
+            if friend_info.last_log_number == 0 and log.opcode == OperationCode.REGISTER.value:
+                h = self.hash_block(log.opcode, log.data, friend_info.last_hash)
+                if h == log.h:
+                    if crypto.verify_sign(log.pk, codec.encode(h), log.signature):
+                        friend_info.trusted_keys.add(log.pk)
+                        friend_info.last_hash = h
+                    else:
+                        raise errors.SynchronizationError("signature doesn't pass")
+                else:
+                    raise errors.SynchronizationError("hash doesn't match")
+            else:
+                errors.SynchronizationError("Registration not at start")
             if log.opcode == OperationCode.PUT_PHOTO.value:
                 log_data = PutPhotoLogData.decode(log.data)
                 photo_blob = self._fetch_photo(log_data.photo_id, friend_username)
+                h = self.hash_block(log.opcode, log.data+photo_blob, friend_info.last_hash)
+                self.friend_check("PUT PHOTO", log, h, friend_info)
                 friend_info.photos.append(photo_blob)
+                friend_info.last_hash = h
+            if log.opcode == OperationCode.DEVICE_INVITE.value:
+                h = self.hash_block(log.opcode, log.data, friend_info.last_hash)
+                self.friend_check("INVITE", log, h, friend_info)
+                friend_info.awaiting_invite.add(log.data)
+                friend_info.last_hash = h
+            if log.opcode == OperationCode.DEVICE_ADDED.value:
+                h = self.hash_block(log.opcode, log.data, friend_info.last_hash)
+                self.friend_check("ADDED", log, h, friend_info)
+                friend_info.awaiting_invite.remove(log.data)
+                friend_info.trusted_keys.add(log.data)
+                friend_info.last_hash = h
+            if log.opcode == OperationCode.DEVICE_REVOKED.value:
+                h = self.hash_block(log.opcode, log.data, friend_info.last_hash)
+                self.friend_check("REVOKED", log, h, friend_info)
+                if log.data in friend_info.trusted_keys:
+                    friend_info.trusted_keys.remove(log.data)
+                if log.data in friend_info.awaiting_invite:
+                    friend_info.awaiting_invite.remove(log.data)
+                friend_info.last_hash = h
+
             friend_info.last_log_number += 1
+
+    def friend_check(self, stage, log, h, friend_info):
+        if h != log.h:
+            raise errors.SynchronizationError("{} Hash doesn't match".format(stage))
+        if not crypto.verify_sign(log.pk, codec.encode(h), log.signature):
+            raise errors.SynchronizationError("{}: Message sign not match".format(stage))
+        if log.pk not in friend_info.trusted_keys and stage != "ADDED":
+            raise errors.SynchronizationError("{}: Image from untrusted user".format(stage))
+        if stage == "ADDED":
+            if log.pk not in friend_info.awaiting_invite:
+                raise errors.SynchronizationError("{}: Not on invite list".format(stage))
 

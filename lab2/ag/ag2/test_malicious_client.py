@@ -62,6 +62,7 @@ def revoked_device_puts_photo():
     alice.add_friend("bob", bob.public_key)
     try:
         bob_photos = alice.get_friend_photos("bob")
+        print(bob_photos)
     except errors.SynchronizationError:
         return pts
 
