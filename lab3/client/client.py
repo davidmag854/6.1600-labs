@@ -23,11 +23,17 @@ from ag.common.mock_http import (
 
 @dataclass
 class FriendInfo:
+    pk: bytes
     trusted_keys: t.Set[bytes]
     photos: t.List[bytes]
     last_log_number: int
     last_hash: int
     awaiting_invite: t.Set[bytes]
+
+
+class ExtendedProfileContent(types.ProfileContents):
+    MAC_pk: bytes
+
 
 
 class Client:
@@ -88,9 +94,9 @@ class Client:
             self._user_secret.get_symmetric_key()
         )
 
-        self._device_public_key_signer = (
-            crypto.PublicKeySignature()
-        )  # not derived from user secret---every device gets its own key pair
+        # self._device_public_key_signer = (
+        #     crypto.PublicKeySignature()
+        # )  # not derived from user secret---every device gets its own key pair
 
         self._photos: t.List[bytes] = []  # list of photos in put_photo order
         self._last_log_number: int = 0
@@ -113,11 +119,22 @@ class Client:
         self._albums: t.Dict[str, Album] = {}  # maps album name to album contents
         self._public_profile = types.PublicProfile(
             username=username,
-            contents=types.ProfileContents(
-                encrypt_public_key=self.encryption_public_key
+            contents=ExtendedProfileContent(
+                encrypt_public_key=self.encryption_public_key,
+                MAC_pk=self.signing_public_key
             ),
-            metadata=b"",
+            metadata=self._public_key_signer.sign(
+                self.pack_and_hash(self.encryption_public_key, self.signing_public_key))
         )
+
+
+
+    @staticmethod
+    def pack_and_hash(*data):
+        h = hash(None)
+        for d in data:
+            h = hash(hash(d)+h)
+        return codec.encode(h)
 
     def send_rpc(self, request: types.RpcObject) -> types.RpcObject:
         """
@@ -283,6 +300,7 @@ class Client:
         """Update user public profile with the given fields."""
         # TODO (lab0): Update te local public profile based on the given values and update the server
         self._public_profile["contents"].update(values)
+        self._public_profile["metadata"] = self._public_key_signer.sign(self.pack_and_hash(*values.values()))
         req = types.UpdatePublicProfileRequest(
             client_id=self._client_id,
             username=self._username,
@@ -304,6 +322,8 @@ class Client:
         # TODO (lab0): Fetch and return the public profile of the user friend_username
         if friend_username != self.username and friend_username not in self._friends:
             raise errors.UnknownUserError(friend_username)
+        if friend_username == self.username:
+            return self._public_profile
         req = types.GetFriendPublicProfileRequest(
             client_id=self._client_id,
             username=self._username,
@@ -317,6 +337,16 @@ class Client:
         elif resp.error is not None:
             raise Exception(resp)
         else:
+            # get sign key of friend
+            friend_pk = self._friends.get(friend_username).pk
+            # check the signature in metadata is verified by
+            data = self.pack_and_hash(*resp.public_profile["contents"].values())
+            if not crypto.verify_sign(
+                pk=friend_pk,
+                data=data,
+                signature=resp.public_profile["metadata"]
+            ):
+                raise errors.SynchronizationError("Public profile signature doesn't match")
             return resp.public_profile
 
     def list_photos(self) -> t.List[int]:
@@ -646,7 +676,7 @@ class Client:
         If the friend already exists, overwrites their public key
         with the provided one.
         """
-        self._friends[friend_username] = FriendInfo(set([friend_signing_public_key]), [], 0, hash(None), set())
+        self._friends[friend_username] = FriendInfo(friend_signing_public_key, set(), [], 0, hash(None), set())
 
     def get_friend_photos(self, friend_username) -> t.List[bytes]:
         self._synchronize_friend(friend_username)
@@ -680,7 +710,8 @@ class Client:
                 h = self.hash_block(log.opcode, log.data, friend_info.last_hash)
                 if h == log.h:
                     if crypto.verify_sign(log.pk, codec.encode(h), log.signature):
-                        friend_info.trusted_keys.add(log.pk)
+                        if friend_info.pk != log.pk:
+                            friend_info.trusted_keys.add(log.pk)
                         friend_info.last_hash = h
                     else:
                         raise errors.SynchronizationError("signature doesn't pass")
@@ -727,6 +758,15 @@ class Client:
         if stage == "ADDED":
             if log.pk not in friend_info.awaiting_invite:
                 raise errors.SynchronizationError("{}: Not on invite list".format(stage))
+
+    def encrypt_photo(self):
+        pass
+
+    def decrypt_photo(self, sk, photo):
+        pass
+
+    def encrypt_album(self):
+        pass
 
     def create_shared_album(
         self, album_name: str, photos: t.List[bytes], friends: t.List[str]
