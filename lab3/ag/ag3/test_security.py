@@ -106,7 +106,9 @@ def check_view(
     Otherwise, a new view will be created.
     """
     request = server.last_album_get_request
+    # print(f"last album request: {request}")
     response = server.last_album_get_response
+    # print(f"last album response: {response}")
     if type(request) != types.GetAlbumRequest:
         raise ValueError("Server request type incorrect")
     if request.username != user.username:
@@ -116,6 +118,8 @@ def check_view(
     if view is None:
         view = co.View(user)
     view.add_obj(response.album)
+    # print(f"View o: {view}")
+    # print(f"View: {view.available_data}")
     overlap = set()
     for p in photos:
         if p in view.available_data:
@@ -138,11 +142,14 @@ def album_contains_all(
 ) -> bool:
     co.current_owner = user.username
     result = user.get_album(album_name)["photos"]
+    # print(f"Album get result: {result}")
+    # print(photos)
     if set(photos).intersection(set(result)) != set(photos):
         # correctness failed!
         print("\tcorrectness failed! Got", result, "expected", photos)
         return False
     if check_view(user, server, photos, view=view) == ViewStatus.ALL:
+        # print("returning true")
         return True
     return False
 

@@ -51,6 +51,7 @@ class OperationCode(IntEnum):
     DEVICE_INVITE = auto()
     DEVICE_ADDED = auto()
     DEVICE_REVOKED = auto()
+    ALBUM_KEY = auto()
 
 
 class LogEntry:

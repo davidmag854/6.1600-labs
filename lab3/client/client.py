@@ -117,6 +117,7 @@ class Client:
             self._user_secret.get_encrypt_and_auth_secret_key()
         )
         self._albums: t.Dict[str, Album] = {}  # maps album name to album contents
+        self._album_keys: t.Dict[str, int] = {}
         self._public_profile = types.PublicProfile(
             username=username,
             contents=ExtendedProfileContent(
@@ -515,7 +516,6 @@ class Client:
             # when a device accepts invite they will push log abd only then other devices will be able to add
             raise errors.SynchronizationError("device not allowed to add log")
 
-
     def _synchronize(self):
         """Synchronize the client's state against the server.
 
@@ -710,8 +710,8 @@ class Client:
                 h = self.hash_block(log.opcode, log.data, friend_info.last_hash)
                 if h == log.h:
                     if crypto.verify_sign(log.pk, codec.encode(h), log.signature):
-                        if friend_info.pk != log.pk:
-                            friend_info.trusted_keys.add(log.pk)
+                        # if friend_info.pk != log.pk:
+                        friend_info.trusted_keys.add(log.pk)
                         friend_info.last_hash = h
                     else:
                         raise errors.SynchronizationError("signature doesn't pass")
@@ -745,28 +745,97 @@ class Client:
                 if log.data in friend_info.awaiting_invite:
                     friend_info.awaiting_invite.remove(log.data)
                 friend_info.last_hash = h
+            if log.opcode == OperationCode.ALBUM_KEY.value:
+                h = self.hash_block(log.opcode, log.data, friend_info.last_hash)
+                self.friend_check("ALBUM", log, h, friend_info)
+                friend_info.last_hash=h
+                # check if the message is for me
+                if log.pk == self._authenticated_encryption.public_key:
+                    # get friend pk
+                    friend_pp = self.get_friend_public_profile(friend_username)
+                    friend_auth_pk = friend_pp["contents"]["encrypt_public_key"]
+                    # if the messsage is for me decrypt the message
+                    dec_data = self._authenticated_encryption.decrypt_and_verify(
+                        ciphertext=log.data,
+                        friend_pk=friend_auth_pk
+                    )
+                    dec_data = codec.decode(dec_data)
+                    album_name = dec_data[0]
+                    album_key = dec_data[1]
+                    self._album_keys[album_name] = album_key
+
             friend_info.last_log_number += 1
 
     @staticmethod
     def friend_check(stage, log, h, friend_info):
         if h != log.h:
             raise errors.SynchronizationError("{} Hash doesn't match".format(stage))
-        if not crypto.verify_sign(log.pk, codec.encode(h), log.signature):
+        uploader_pk = log.pk
+        if stage == "ALBUM":
+            uploader_pk = friend_info.pk
+        if not crypto.verify_sign(uploader_pk, codec.encode(h), log.signature):
             raise errors.SynchronizationError("{}: Message sign not match".format(stage))
-        if log.pk not in friend_info.trusted_keys and stage != "ADDED":
+        if uploader_pk not in friend_info.trusted_keys and stage not in {"ADDED", "ALBUM"}:
             raise errors.SynchronizationError("{}: Image from untrusted user".format(stage))
         if stage == "ADDED":
-            if log.pk not in friend_info.awaiting_invite:
+            if uploader_pk not in friend_info.awaiting_invite:
                 raise errors.SynchronizationError("{}: Not on invite list".format(stage))
 
-    def encrypt_photo(self):
-        pass
+    @staticmethod
+    def decrypt_album(key, album:t.List[bytes]):
+        dec_album = []
+        decrypter = crypto.SymmetricKeyEncryption(key)
+        for photo in album:
+            dec_album.append(decrypter.decrypt(photo))
+        return dec_album
 
-    def decrypt_photo(self, sk, photo):
-        pass
+    @staticmethod
+    def encrypt_album(key, album:t.List[bytes]):
+        enc_album = []
+        encrypter = crypto.SymmetricKeyEncryption(key)
+        for photo in album:
+            enc_album.append(encrypter.encrypt(photo))
+        return enc_album
 
-    def encrypt_album(self):
-        pass
+    @staticmethod
+    def create_album_symmetric_key():
+        return crypto.SymmetricKeyEncryption()
+
+    def publish_album_key_to_friends(self, album_name, album, friends:t.List[types.PublicProfile], key):
+        # for every friend that is added sign
+        for friend_public_profile in friends:
+            album_friend_signature = self._public_key_signer.sign(codec.encode(hash(friend_public_profile["username"])))
+            album.metadata[friend_public_profile["username"]] = album_friend_signature
+            album.metadata[friend_public_profile["username"]+"_key"] = self._authenticated_encryption.encrypt_and_auth(
+                data=key,
+                friend_pk=friend_public_profile["contents"]["encrypt_public_key"]
+            )
+            data = [album_name, key]
+            # send key to friend
+            log_data = self._authenticated_encryption.encrypt_and_auth(
+                data=codec.encode(data),
+                friend_pk=friend_public_profile["contents"]["encrypt_public_key"]
+            )
+            log_h = self.hash_block(
+                operation=OperationCode.ALBUM_KEY.value,
+                data=log_data
+            )
+            # log signed with owner's friend info pk
+            log_signature = self._public_key_signer.sign(codec.encode(log_h))
+            log_public_key_recepient_autnenc_pk = friend_public_profile["contents"]["encrypt_public_key"]
+            log = LogEntry(
+                opcode=OperationCode.ALBUM_KEY,
+                data=log_data,
+                public_key=log_public_key_recepient_autnenc_pk,
+                signature=log_signature,
+                h=log_h
+            )
+            self._push_log_entry(log)
+
+    def sync_all_friends(self):
+        for friend in self._friends.keys():
+            if friend != self.username:
+                self._synchronize_friend(friend)
 
     def create_shared_album(
         self, album_name: str, photos: t.List[bytes], friends: t.List[str]
@@ -777,19 +846,40 @@ class Client:
 
         All friends in `friends` must have been added to this device via `add_friend()` beforehand.
         """
+        self.sync_all_friends()
         friends_pp_mapping = {
             username: self.get_friend_public_profile(username) for username in friends
         }
+        # friends_pp_mapping key = username
+        # friends_pp_mapping value = verified friend public profile
         if self.username not in friends_pp_mapping:
             friends_pp_mapping[self.username] = self._public_profile
         album = Album(
             photos=photos, owner=self.username, friends=friends_pp_mapping, metadata={}
         )
         self._albums[album_name] = album
+        # create album symmetric key
+        key = crypto.generate_symmetric_secret_key()
+        # save key locally
+        self._album_keys[album_name] = key
+        # send key to all of my friends
+        self.publish_album_key_to_friends(album_name=album_name, album=album, friends=friends_pp_mapping.values(), key=key)
         self._upload_album(album_name)
 
     def _upload_album(self, album_name: str):
+        self.sync_all_friends()
         album = self._albums[album_name]
+        # copy album so locally we will have the decrypted version
+        album = Album.from_dict(album.as_dict())
+        # Check album key exist
+        if album_name not in self._album_keys.keys():
+            # raise errors.AlbumPermissionError(album_name)
+            return
+        # get album key
+        key = self._album_keys[album_name]
+        # encrypt all photos
+        album.photos = self.encrypt_album(key, album.photos)
+        # upload encrypted version
         req = types.UploadAlbumRequest(
             self._client_id,
             self._username,
@@ -811,7 +901,7 @@ class Client:
 
         Note: the owner must have been added as a friend to the device using add_friend.
         """
-
+        self.sync_all_friends()
         req = types.GetAlbumRequest(
             self._client_id, self._username, self._server_session_token, album_name
         )
@@ -833,8 +923,22 @@ class Client:
 
         if self._username not in resp.album["friends"]:
             raise errors.AlbumPermissionError(album_name)
-        self._albums[album_name] = Album.from_dict(resp.album)
-        return resp.album
+        if album_name not in self._album_keys:
+            raise errors.AlbumPermissionError(album_name)
+        # get key locally
+        key = self._album_keys[album_name]
+        # take album from resp
+        album = Album.from_dict(resp.album)
+        # making sure that the album saved locally only has valid friends
+        if resp.album["owner"] == self.username:
+            owner_pk = self.signing_public_key
+        else:
+            owner_pk = self._friends[resp.album["owner"]].pk
+        album.veirfy_friends(owner_pk)
+        album.photos = self.decrypt_album(key, album.photos)
+        self._albums[album_name] = album
+        # this should return the decrypted album
+        return self._albums[album_name].as_dict()
 
     def add_friend_to_album(self, album_name: str, friend_username: str):
         """Add a friend to an existing album with name album_name.
@@ -843,25 +947,50 @@ class Client:
         Note: the friend must have been added as a friend to the device using add_friend.
         If they are not, raise an errors.UnknownUserError.
         """
+        self.sync_all_friends()
         if friend_username not in self._friends:
             raise errors.UnknownUserError(friend_username)
 
         if not self._albums[album_name].owner == self.username:
             return errors.AlbumOwnerError(album_name)
+
+        if album_name not in self._album_keys:
+            raise errors.AlbumPermissionError(album_name)
         self.get_album(album_name)
         friend_pp = self.get_friend_public_profile(friend_username)
+        # print(f"{self.username} Trying to add {friend_pp}")
+        # add friend to album
         self._albums[album_name].add_friend(friend_pp)
+        # send album key to friend + add friend signature
+        key = self._album_keys[album_name]
+        # print(f"Album key is {key}")
+        self.publish_album_key_to_friends(album_name, self._albums[album_name], [friend_pp], key)
+        # upload the new album to friend
         self._upload_album(album_name)
 
     def remove_friend_from_album(self, album_name: str, friend_username: str):
         """Add a friend to an existing album with name album_name.
         Only the owner of the album can modify the list of friends.
         """
-
+        self.sync_all_friends()
         if not self._albums[album_name].owner == self.username:
             return errors.AlbumOwnerError(album_name)
         self.get_album(album_name)
         self._albums[album_name].remove_friend(friend_username)
+        # need to generate new key!
+        new_key = crypto.generate_symmetric_secret_key()
+        # update key
+        self._album_keys[album_name] = new_key
+        # remove friend from album locally
+        self._albums[album_name].remove_friend(friend_username)
+        # verify all current friend were added by owner
+        self._albums[album_name].veirfy_friends(self._public_key_signer.public_key)
+        # send new key to verified friends
+        self.publish_album_key_to_friends(
+            album_name=album_name,
+            album=self._albums[album_name],
+            friends=self._albums[album_name].friends.values(),
+            key=new_key)
         self._upload_album(album_name)
 
     def add_photo_to_album(self, album_name: str, photo: bytes):
@@ -870,9 +999,17 @@ class Client:
 
         Note: the owner of the album must have been added as a friend on this device.
         """
-
+        self.sync_all_friends()
         self.get_album(album_name)
-        self._albums[album_name].add_photo(photo)
+        album = self._albums[album_name]
+        if album.owner == self.username:
+            owner_pk = self.signing_public_key
+        else:
+            owner_pk = self._friends[album.owner].pk
+        album.veirfy_friends(owner_pk)
+
+        if self.username in album.friends.keys():
+            album.add_photo(photo)
         self._upload_album(album_name)
 
 
@@ -892,7 +1029,7 @@ class Album:
             "photos": self.photos,
             "owner": self.owner,
             "friends": self.friends,
-            "metadata": codec.encode(self.metadata),
+            "metadata": codec.encode(self.metadata)
         }
 
     @staticmethod
@@ -901,7 +1038,7 @@ class Album:
             photos=data["photos"],
             owner=data["owner"],
             friends=data["friends"],
-            metadata=codec.decode(data["metadata"]),
+            metadata=codec.decode(data["metadata"])
         )
 
     def add_photo(self, photo: bytes) -> None:
@@ -920,5 +1057,21 @@ class Album:
         """
         remove the given friend's permission from the album
         """
-        del self.friends[friend_username]
+        if friend_username in self.friends.keys():
+            del self.friends[friend_username]
+        if friend_username in self.metadata.keys():
+            del self.metadata[friend_username]
+
+    def add_friend_signature(self, friend_name, signature):
+        self.metadata[friend_name] = signature
+
+    def veirfy_friends(self, owner_pk):
+        for friend_username in self.friends.copy().keys():
+            if friend_username not in self.metadata.keys():
+                self.remove_friend(friend_username)
+            # if it is in the metadata, make sure the signature is verified
+            elif not crypto.verify_sign(owner_pk, codec.encode(hash(friend_username)), self.metadata[friend_username]):
+                # if signature not verified remove friend
+                self.remove_friend(friend_username)
+
 
