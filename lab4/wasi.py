@@ -118,7 +118,7 @@ def wasi_oflags_to_flags(oflags):
     if oflags & WASI_OFLAGS_TRUNC: flags |= os.O_TRUNC
     return flags
 
-def oserror_errno(e):
+def oserror_errno(e: Exception):
     match e.errno:
         case errno.ENOENT:
             return WASI_ERRNO_NOENT
@@ -168,7 +168,11 @@ class OpenFile:
         return os.read(self.fd, n)
 
     def check_path(self, pn):
+        # gets a path name
+        # checks the depth
         depth = self.depth
+        print(f"CHECK PATH: depth: {depth}")
+        print(f"CHECK PATH: path: {pn}")
         for n in pn.split(b'/'):
             if n == b'' or n == b'.':
                 continue
@@ -208,11 +212,14 @@ class Wasi:
         return do
 
     def get_fd(self, fd: int, expect_type = None):
+        # print(f"get fd {fd}")
         if fd not in self.fds:
             raise OSError(errno.EBADF, 'Bad file descriptor')
         f = self.fds[fd]
         if expect_type is not None and not isinstance(f, expect_type):
             raise OSError(errno.EINVAL, 'Invalid argument')
+        if type(f) == OpenFile:
+            print(f"Returning {f.fd} with depth {f.depth}")
         return f
 
     def alloc_fd(self, obj):
@@ -255,7 +262,9 @@ class Wasi:
     def fd_filestat_get(self, s: pywasm.Store, fd: int, retptr: int) -> int:
         self.trace("fd_filestat_get", fd)
         f = self.get_fd(fd)
+
         if isinstance(f, OpenFile):
+            print(f"{fd}: depth = {f.depth}")
             st = os.fstat(f.fd)
             res = stat_to_filestat_t(st)
         else:
@@ -264,8 +273,14 @@ class Wasi:
         return 0
 
     def fd_read(self, s: pywasm.Store, fd: int, iovs: int, iovs_len: int, retptr: int) -> int:
+        # read doesn't check the read path, it only receives fd id
+        # fd_read assumes fd is valid
+        # print("FD READ")
         self.trace("fd_read", fd, iovs_len)
+        # print(f"fd: {fd}")
         f = self.get_fd(fd)
+        # print(f"Recevied f: {f}")
+        # print(f"Iovs len: {iovs_len}")
         cc = 0
         for i in range(0, iovs_len):
             iov = load(s, iovs, ciovec_t)
@@ -278,6 +293,8 @@ class Wasi:
                 break
             iovs += ctypes.sizeof(iov)
         store(s, retptr, size_t(cc))
+        # print(f"Storing s {s}")
+        # print("---DONE READ---")
         return 0
 
     def fd_write(self, s: pywasm.Store, fd: int, iovs: int, iovs_len: int, retptr: int) -> int:
@@ -296,6 +313,7 @@ class Wasi:
         return 0
 
     def fd_readdir(self, s: pywasm.Store, fd: int, buf: int, buflen: int, cookie: int, retsize: int) -> int:
+        print("FD READDIR")
         self.trace("fd_readdir", fd, buf, buflen, cookie, retsize)
         f = self.get_fd(fd, OpenFile)
 
@@ -331,6 +349,7 @@ class Wasi:
         return 0
 
     def path_create_directory(self, s: pywasm.Store, fd: int, pathptr: int, pathlen: int) -> int:
+        print(f"CREATE DIR: using fd {fd}")
         p = loadbytes(s, pathptr, pathlen)
         self.trace("path_create_directory", fd, p)
         f = self.get_fd(fd, OpenFile)
@@ -339,6 +358,7 @@ class Wasi:
         return 0
 
     def path_remove_directory(self, s: pywasm.Store, fd: int, pathptr: int, pathlen: int) -> int:
+        print(f"REMOVE DIR: using fd {fd}")
         p = loadbytes(s, pathptr, pathlen)
         self.trace("path_remove_directory", fd, p)
         f = self.get_fd(fd, OpenFile)
@@ -380,11 +400,19 @@ class Wasi:
         return 0
 
     def path_open(self, s: pywasm.Store, dirfd: int, dirflags: int, pathptr: int, pathlen: int, oflags: int, rbase: int, rinherit: int, fdflags: int, retfd: int) -> int:
+        # if I open at path, it takes the file descriptor
+        # but the path its gived me
+        print(f"PATH OPEN!")
+        print(f"dirfd: {dirfd}")
+
         path = loadbytes(s, pathptr, pathlen)
         self.trace("path_open", dirfd, path)
+        ## takes the fd which is OpenFile type and has a depth
         f = self.get_fd(dirfd, OpenFile)
+        print(f"f recevied {f.depth}")
+        print(f"requested path {path}")
+        # check if the current file dec with the new path is valid
         depth = f.check_path(path)
-
         flags = wasi_oflags_to_flags(oflags)
         newfd = os.open(path, flags, dir_fd = f.fd)
         newf = OpenFile(newfd, depth)
@@ -418,6 +446,7 @@ class Wasi:
 
     def args_get(self, s: pywasm.Store, argv: int, argv_buf: int) -> int:
         self.trace("args_get", argv, argv_buf)
+        print(f"Args get {argv}")
         for arg in self.args:
             store(s, argv, size_t(argv_buf))
             storestr(s, argv_buf, len(arg)+1, arg)

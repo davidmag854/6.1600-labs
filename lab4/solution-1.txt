@@ -1,0 +1,3 @@
+ln -s ../secret.txt ./check.txt
+fd_open ./check.txt
+fd_read 4
